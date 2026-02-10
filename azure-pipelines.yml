@@ -3,16 +3,12 @@ pool:
   vmImage: ubuntu-latest
 
 steps:
-- task: ManualIntervention@5
-  inputs:
-    instructions: 'Approve in ServiceNow to continue.'
-
 - script: |
     curl -X POST \
-      https://your-function-app.azurewebsites.net/api/orchestrators/StartRecommendation \
+      https://your-function-app.azurewebsites.net/api/list-storages \
       -H "Content-Type: application/json" \
       -d '{
-        "resourceId": "$(resourceId)",
-        "newSize": "$(newSize)"
-      }'
-  displayName: 'Run Durable Function'
+        "subscriptions": ["3d2daa56-667a-45ee-8bef-31f8e40057b2"]
+      }' \
+      --silent --show-error
+  displayName: 'Trigger storage list function'
