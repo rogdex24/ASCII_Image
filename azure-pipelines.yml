@@ -1,0 +1,18 @@
+trigger: none
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- task: ManualIntervention@5
+  inputs:
+    instructions: 'Approve in ServiceNow to continue.'
+
+- script: |
+    curl -X POST \
+      https://your-function-app.azurewebsites.net/api/orchestrators/StartRecommendation \
+      -H "Content-Type: application/json" \
+      -d '{
+        "resourceId": "$(resourceId)",
+        "newSize": "$(newSize)"
+      }'
+  displayName: 'Run Durable Function'
