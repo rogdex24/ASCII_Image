@@ -4,11 +4,10 @@ pool:
 
 steps:
 - script: |
-    curl -X POST \
-      https://your-function-app.azurewebsites.net/api/list-storages \
+    RESPONSE=$(curl -X POST \
+      https://auto-rec-test-dhekgyd5afaxgqbk.westeurope-01.azurewebsites.net/api/list-storages \
       -H "Content-Type: application/json" \
-      -d '{
-        "subscriptions": ["3d2daa56-667a-45ee-8bef-31f8e40057b2"]
-      }' \
-      --silent --show-error
+      -d '{"subscriptions": ["3d2daa56-667a-45ee-8bef-31f8e40057b2"]}')
+
+    echo "Function said: $RESPONSE"
   displayName: 'Trigger storage list function'
