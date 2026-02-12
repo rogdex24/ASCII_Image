@@ -1,13 +1,181 @@
+# Recommendation automation pipeline (no approval)
+# Executes function immediately on trigger and always posts callback.
+
 trigger: none
-pool:
-  name: self-hosted-test
+pr: none
 
-steps:
-- script: |
-    RESPONSE=$(curl -X POST \
-      https://auto-rec-test-dhekgyd5afaxgqbk.westeurope-01.azurewebsites.net/api/list-storages \
-      -H "Content-Type: application/json" \
-      -d '{"subscriptions": ["3d2daa56-667a-45ee-8bef-31f8e40057b2"]}')
+parameters:
+  - name: function_name
+    displayName: Function name
+    type: string
+    default: apply_default_recommendation
+  - name: rec_data
+    displayName: Recommendation Payload (JSON)
+    type: object
+    default:
+      organization_id: ""
+      recommendation_id: ""
+      rec_run_id: ""
+      scenario_id: ""
+      discovered_resource_id: ""
+      resource_id: ""
+      resource_type: ""
+      region: ""
+      service: ""
+      current_configuration: ""
+      recommended_configuration: ""
+      current_monthly_cost: ""
+      target_monthly_cost: ""
+      monthly_savings: ""
+      annual_savings: ""
 
-    echo "Function said: $RESPONSE"
-  displayName: 'Trigger storage list function'
+variables:
+  backendWebhookUrl: "http://localhost:8118/api/v3/internal/recommendations/automation/webhook"
+  functionAppName: "replace-me"
+
+stages:
+  - stage: Automation
+    displayName: "Recommendation Automation (No Approval)"
+    jobs:
+      - job: ExecuteFunction
+        displayName: "Execute function immediately"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - bash: |
+              set +e
+
+              JSON_DATA="$REC_JSON"
+              FUNCTION_NAME="$FUNCTION_NAME_PARAM"
+              FINAL_BODY="$(echo "$JSON_DATA" | jq --arg fn "$FUNCTION_NAME" '. + {function_name: $fn}')"
+
+              if [ -z "$FUNCTIONKEY" ]; then
+                echo "Missing required secret pipeline variable: functionKey"
+                exit 1
+              fi
+
+              if ! echo "$FINAL_BODY" | jq -e '
+                (.organization_id // "") != "" and
+                (.recommendation_id // "") != "" and
+                (.rec_run_id // "") != "" and
+                (.scenario_id // "") != ""
+              ' >/dev/null; then
+                echo "rec_data is missing required fields: organization_id, recommendation_id, rec_run_id, scenario_id"
+                exit 1
+              fi
+
+              RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST "https://$(functionAppName).azurewebsites.net/api/${FUNCTION_NAME}?code=${FUNCTIONKEY}" \
+                -H "Content-Type: application/json" \
+                -d "$FINAL_BODY")
+
+              HTTP_STATUS=$(echo "$RESPONSE" | tail -n 1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+
+              ENCODED_RES=$(printf '%s' "$BODY" | base64 | tr -d '\n')
+              echo "##vso[task.setvariable variable=fnOutput;isOutput=true]$ENCODED_RES"
+              echo "##vso[task.setvariable variable=fnHttpStatus;isOutput=true]$HTTP_STATUS"
+
+              if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+                exit 0
+              fi
+
+              echo "Function invocation failed with HTTP $HTTP_STATUS"
+              exit 1
+            name: AzureStep
+            displayName: "Invoke Function and capture response"
+            env:
+              FUNCTION_NAME_PARAM: ${{ parameters.function_name }}
+              REC_JSON: '${{ convertToJson(parameters.rec_data) }}'
+              FUNCTIONKEY: $(functionKey)
+
+      - job: Callback
+        displayName: "Final backend callback"
+        dependsOn: ExecuteFunction
+        condition: always()
+        variables:
+          capturedResponse: $[ dependencies.ExecuteFunction.outputs['AzureStep.fnOutput'] ]
+          capturedHttpStatus: $[ dependencies.ExecuteFunction.outputs['AzureStep.fnHttpStatus'] ]
+        steps:
+          - bash: |
+              set +e
+
+              JSON_DATA="$REC_JSON"
+              if [ -z "$BACKENDWEBHOOKSECRET" ]; then
+                echo "Missing required secret pipeline variable: backendWebhookSecret"
+                exit 1
+              fi
+
+              EXECUTE_RESULT="$(dependencies.ExecuteFunction.result)"
+              FUNCTION_NAME="$FUNCTION_NAME_PARAM"
+              ORG_ID="$(echo "$JSON_DATA" | jq -r '.organization_id // ""')"
+              REC_ID="$(echo "$JSON_DATA" | jq -r '.recommendation_id // ""')"
+              REC_RUN_ID="$(echo "$JSON_DATA" | jq -r '.rec_run_id // ""')"
+              SCENARIO_ID="$(echo "$JSON_DATA" | jq -r '.scenario_id // ""')"
+
+              if [ "$EXECUTE_RESULT" = "Succeeded" ]; then
+                FUNCTION_STATUS="succeeded"
+                FUNCTION_ERROR=""
+              elif [ "$EXECUTE_RESULT" = "Skipped" ]; then
+                FUNCTION_STATUS="not_run"
+                FUNCTION_ERROR="Function execution skipped"
+              else
+                FUNCTION_STATUS="failed"
+                FUNCTION_ERROR="Function invocation failed"
+              fi
+
+              DECODED_RES=$(printf '%s' "$(capturedResponse)" | base64 --decode 2>/dev/null || true)
+              HTTP_STATUS="$(capturedHttpStatus)"
+
+              if echo "$DECODED_RES" | jq -e . >/dev/null 2>&1; then
+                FN_RES_JSON="$DECODED_RES"
+              else
+                FN_RES_JSON=$(jq -Rn --arg raw "$DECODED_RES" '$raw')
+              fi
+
+              jq -n \
+                --arg organization_id "$ORG_ID" \
+                --arg recommendation_id "$REC_ID" \
+                --arg rec_run_id "$REC_RUN_ID" \
+                --arg scenario_id "$SCENARIO_ID" \
+                --arg pipeline_run_id "$(Build.BuildId)" \
+                --arg manual_approval_status "$EXECUTE_RESULT" \
+                --arg function_status "$FUNCTION_STATUS" \
+                --arg function_name "$FUNCTION_NAME" \
+                --arg function_error "$FUNCTION_ERROR" \
+                --arg pipeline_status "$(Agent.JobStatus)" \
+                --arg build_number "$(Build.BuildNumber)" \
+                --arg source_branch "$(Build.SourceBranch)" \
+                --arg repository "$(Build.Repository.Name)" \
+                --arg http_status "$HTTP_STATUS" \
+                --argjson function_response "$FN_RES_JSON" \
+                '{
+                  organization_id: $organization_id,
+                  recommendation_id: $recommendation_id,
+                  rec_run_id: $rec_run_id,
+                  scenario_id: $scenario_id,
+                  pipeline_run_id: $pipeline_run_id,
+                  manual_approval_status: $manual_approval_status,
+                  function_status: $function_status,
+                  function_name: $function_name,
+                  function_response: $function_response,
+                  function_error: $function_error,
+                  pipeline_status: $pipeline_status,
+                  metadata: {
+                    build_number: $build_number,
+                    source_branch: $source_branch,
+                    repository: $repository,
+                    function_http_status: $http_status
+                  }
+                }' > payload.json
+
+              curl -sS -X POST "$(backendWebhookUrl)" \
+                -H "Content-Type: application/json" \
+                -H "x-recommendation-webhook-secret: ${BACKENDWEBHOOKSECRET}" \
+                -d @payload.json
+
+              exit 0
+            displayName: "POST callback"
+            env:
+              FUNCTION_NAME_PARAM: ${{ parameters.function_name }}
+              REC_JSON: '${{ convertToJson(parameters.rec_data) }}'
+              BACKENDWEBHOOKSECRET: $(backendWebhookSecret)
